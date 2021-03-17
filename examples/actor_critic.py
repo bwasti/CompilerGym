@@ -35,6 +35,7 @@ from absl import app, flags
 from torch.distributions import Categorical
 
 import compiler_gym  # noqa Register environments.
+from compiler_gym.util.flags.env_from_flags import env_from_flags
 
 flags.DEFINE_list(
     "flags",
@@ -57,7 +58,7 @@ flags.DEFINE_list(
     ],
     "List of optimizatins to explore.",
 )
-flags.DEFINE_string("reward", "IrInstructionCount", "The reward function to optimize.")
+#flags.DEFINE_string("reward", "IrInstructionCount", "The reward function to optimize.")
 flags.DEFINE_string("benchmark", "cBench-v1/dijkstra", "Benchmark to optimize.")
 flags.DEFINE_integer("episode_len", 5, "Number of transitions per episode.")
 flags.DEFINE_integer("hidden_size", 64, "Latent vector size.")
@@ -69,6 +70,7 @@ flags.DEFINE_float("learning_rate", 0.008, "The learning rate for training.")
 flags.DEFINE_float("exploration", 0.0, "Rate to explore random transitions.")
 flags.DEFINE_float("mean_smoothing", 0.95, "Smoothing factor for mean normalization.")
 flags.DEFINE_float("std_smoothing", 0.4, "Smoothing factor for std dev normalization.")
+flags.DEFINE_boolean("eval", False, "Load and run model.")
 
 eps = np.finfo(np.float32).eps.item()
 
@@ -117,15 +119,16 @@ class CustomEnv:
     """
 
     def __init__(self):
-        self._env = gym.make("llvm-v0", reward_space=FLAGS.reward)
+        self._env = env_from_flags()
+        #self._env = gym.make("llvm-v0", reward_space=FLAGS.reward)
         try:
-            self._env.require_dataset("cBench-v1")
+            #self._env.require_dataset("cBench-v1")
             self._env.reset(benchmark=FLAGS.benchmark)
 
             # Project onto the subset of transformations that have
             # been specified to be used.
-            self._actions = [self._env.action_space.flags.index(f) for f in FLAGS.flags]
-            self.action_space = [self._env.action_space.flags[a] for a in self._actions]
+            self._actions = [i for i in range(len(self._env.action_space.names))]
+            self.action_space = [self._env.action_space[self._env.action_space.names[a]] for a in self._actions]
 
         finally:
             # The program will not terminate until the environment is
@@ -150,8 +153,11 @@ class CustomEnv:
 
         return self._state, reward, done, info
 
-    def reset(self):
-        self._env.reset()
+    def reset(self, bench=None):
+        if bench:
+          self._env.reset(bench)
+        else:
+          self._env.reset()
         self._steps_taken = 0
         self._state = np.zeros(
             (FLAGS.episode_len - 1, len(self.action_space)), dtype=np.int32
@@ -165,17 +171,17 @@ class CustomEnv:
 class Policy(nn.Module):
     """A very simple actor critic policy model."""
 
-    def __init__(self):
+    def __init__(self, action_space_size):
         super().__init__()
         self.affine1 = nn.Linear(
-            (FLAGS.episode_len - 1) * len(FLAGS.flags), FLAGS.hidden_size
+            (FLAGS.episode_len - 1) * action_space_size, FLAGS.hidden_size
         )
         self.affine2 = nn.Linear(FLAGS.hidden_size, FLAGS.hidden_size)
         self.affine3 = nn.Linear(FLAGS.hidden_size, FLAGS.hidden_size)
         self.affine4 = nn.Linear(FLAGS.hidden_size, FLAGS.hidden_size)
 
         # Actor's layer
-        self.action_head = nn.Linear(FLAGS.hidden_size, len(FLAGS.flags))
+        self.action_head = nn.Linear(FLAGS.hidden_size, action_space_size)
 
         # Critic's layer
         self.value_head = nn.Linear(FLAGS.hidden_size, 1)
@@ -307,8 +313,27 @@ def finish_episode(model, optimizer) -> float:
     return loss_value
 
 
-def TrainActorCritic(env):
-    model = Policy()
+def TrainActorCritic(env, load_from = None):
+    model = Policy(len(env.action_space))
+    if load_from:
+        model.load_state_dict(torch.load(load_from))
+        model.eval()
+        print("trying again")
+        state = env.reset("benchmark-2")
+        ep_reward = 0
+        while True:
+            # Select action from policy.
+            action = select_action(model, state, FLAGS.exploration)
+
+            # Take the action
+            state, reward, done, _ = env.step(action)
+
+            model.rewards.append(reward)
+            ep_reward += reward
+            if done:
+                break
+        print("reward is", ep_reward)
+        return
     optimizer = optim.Adam(model.parameters(), lr=FLAGS.learning_rate)
 
     # These statistics are just for logging.
@@ -365,6 +390,7 @@ def TrainActorCritic(env):
     # One could also return the best found solution here, though that
     # is more random and noisy, while the average reward indicates how
     # well the model is working on a consistent basis.
+    torch.save(model.state_dict(), "policy.pt")
     return avg_reward.value
 
 
@@ -383,6 +409,9 @@ def main(argv):
         print(f"Benchmark: {FLAGS.benchmark}")
         print(f"Action space: {env.action_space}")
 
+        if FLAGS.eval:
+            TrainActorCritic(env, "policy.pt")
+            return
         if FLAGS.iterations == 1:
             TrainActorCritic(env)
             return
